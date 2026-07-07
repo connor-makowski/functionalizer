@@ -19,6 +19,7 @@ To run the training and evaluation suite successfully, you must configure a virt
 2. **Install requirements**:
    ```bash
    pip install -r requirements.txt
+   pip install git+https://github.com/connor-makowski/tokenizers.git@functionalizer#subdirectory=bindings/python
    ```
    *(Note: This requires a Rust toolchain `cargo` to be installed on your system to compile the source code).*
 

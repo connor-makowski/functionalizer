@@ -1,0 +1,17 @@
+{
+  "dataset": "csn-go",
+  "tokenizer_type": "metaspace_split_functionalizer",
+  "vocab_size": 15316,
+  "model_parameters": 26888192,
+  "total_train_time_sec": 336.70658588409424,
+  "avg_step_time_ms": 10.447506475448607,
+  "tokens_per_sec": 60586.87550300061,
+  "chars_per_sec": 126677.29701661847,
+  "peak_vram_gb": 2.8907999992370605,
+  "final_val_loss": 2.816760724005492,
+  "final_ppl_token": 16.72259521484375,
+  "final_ppl_char": 3.846611976623535,
+  "char_to_token_ratio": 2.090837264092758,
+  "train_tokens_count": 7904113,
+  "train_chars_count": 16526214
+}

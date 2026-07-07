@@ -1,0 +1,17 @@
+{
+  "dataset": "csn-python",
+  "tokenizer_type": "llama",
+  "vocab_size": 16000,
+  "model_parameters": 27238400,
+  "total_train_time_sec": 354.81209921836853,
+  "avg_step_time_ms": 11.141670322418213,
+  "tokens_per_sec": 57495.2208364373,
+  "chars_per_sec": 232562.14731529017,
+  "peak_vram_gb": 2.8854832649230957,
+  "final_val_loss": 5.20054976229972,
+  "final_ppl_token": 181.3719024658203,
+  "final_ppl_char": 3.6172239780426025,
+  "char_to_token_ratio": 4.044895278807269,
+  "train_tokens_count": 12372615,
+  "train_chars_count": 50045932
+}

@@ -1,0 +1,550 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage[authoryear]{natbib}
+\usepackage[colorlinks=true,citecolor=blue,linkcolor=blue,urlcolor=blue]{hyperref}
+\usepackage{url}
+\usepackage{newunicodechar}
+\usepackage{microtype}
+\usepackage[margin=1in]{geometry}
+
+% Define unicode characters for Metaspace display
+\newunicodechar{▁}{\textvisiblespace}
+% \newunicodechar{ }{\textunderscore}
+
+\title{The Functionalizer: Lossless Functional Decomposition for Subword Tokenization}
+\author{
+  Connor Makowski \\
+  Center for Transportation \& Logistics \\
+  Massachusetts Institute of Technology \\
+  Cambridge, MA, USA \\
+  \texttt{conmak@mit.edu}
+  \and
+  Willem Guter \\
+  Center for Transportation \& Logistics \\
+  Massachusetts Institute of Technology \\
+  Cambridge, MA, USA \\
+  \texttt{wjguter@mit.edu}
+}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Standard subword tokenizers either treat every orthographic variation of a word (such as \texttt{hello}, \texttt{Hello}, \texttt{HELLO}, and \texttt{H\'{e}llo}) as unrelated vocabulary entries, which fragments the embedding space, or discard this variation through lossy normalization. We present the \textbf{Functionalizer}, a lossless pre-tokenizer framework that factors orthographic and structural variations into a compositional \textbf{opcode/operand} prefix stream before tokenization: a canonical base token (operand) prefixed by parametric transformation operators (opcodes) encoded in the Unicode Private Use Area. We introduce operators covering casing (\texttt{CAPITALIZE}), diacritics (13 dedicated opcodes), and character repetition (\texttt{REPEAT}, \texttt{MULTIREPEAT}), which are fully reversible. Across six natural language and code corpora, the Functionalizer enables complete corpus coverage with significantly smaller vocabularies under unconstrained conditions, reducing actual vocabulary slot requirements by up to \textbf{16\%}. When looking at sequence lengths, we observe a sharp domain-dependent tradeoff: it compresses indentation-heavy code sequences but inflates natural-language prose sequences. Preliminary downstream evaluations on 25M parameter GPT-2 scale models show that at this scale, the Functionalizer drastically improves code syntax validity and improves code character perplexity while maintaining similar text coherence on prose. These findings demonstrate that functional decomposition can be an effective mechanism for vocabulary-efficient, structurally aware language modeling, and motivate further validation at production scale.
+\end{abstract}
+
+\section{Introduction}
+
+Subword tokenizers face a dilemma. Treating \texttt{hello}, \texttt{Hello}, and \texttt{H\'{e}llo} as independent tokens causes \textbf{vocabulary expansion}: redundant surface forms consume embedding slots, and a gradient update to \texttt{Hello} never benefits \texttt{hello}. The alternative, aggressive lowercasing and accent-stripping, is \textbf{lossy}. It compresses the vocabulary but permanently discards information the downstream model can never recover.
+
+The Functionalizer takes a third path: \textbf{lossless functional decomposition}. Rather than memorizing surface forms or destroying them, it factors variation out into reusable \emph{operators} applied to a single \emph{canonical base}. The design is borrowed directly from Instruction Set Architecture: a CPU does not implement a distinct instruction for every constant (\texttt{ADD\_1}, \texttt{ADD\_2}, \dots); it separates the operation (opcode) from its data (operand), as in \texttt{ADD A, \#1}. The Functionalizer applies the same factoring; the base token is the operand, the transformation prefix is the opcode.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+    \item A unified opcode/operand framework that handles casing, diacritics, and character repetition under one compositional, parametric, lossless scheme. Prior work addresses these orthographic variations in isolation, either with lossy normalization or with a single operator that does not necessarily reduce tokenization overhead.
+    \item A concrete Private Use Area (PUA) encoding that is usable in most tokenizers (such as Hugging Face's BPE) and fully reversible.
+    \item Empirical validation across six natural language and code corpora, demonstrating that when unconstrained by target vocabulary limits, the Functionalizer reduces the total vocabulary slots required to fully cover a corpus by up to \textbf{16\%} through the collapse of formatting variations. Regarding sequences, we show a clear domain split: it significantly compresses indentation-heavy code sequences (yielding inference throughput speedups of up to \textbf{22.8\%}) while introducing a measured sequence length cost (6--9\%) on natural-language prose.
+    \item Downstream language modeling training and evaluations at the $\sim$25M parameter scale showing that the Functionalizer significantly improves next-token code predictability (a \textbf{12.6\%} relative improvement in character perplexity for python) and drastically improves basic syntax validity (achieving up to \textbf{9.20\%} syntax success compared to \textbf{0.00\%--2.20\%} for standard baselines) while matching coherence on natural language prose.
+\end{enumerate}
+
+\section{Related Work}
+
+\paragraph{Subword tokenization.} BPE \citep{sennrich2016}, WordPiece \citep{schuster2012}, and Unigram \citep{kudo2018} build vocabularies bottom-up from frequent merges; byte-level BPE \citep{radford2019} avoids out-of-vocabulary failures by operating over 256 byte values. Existing pre-tokenizers that address orthographic variation are either lossy (lowercasing, accent-stripping) or limited to a single operator. For example, \citet{turkish2025} introduce a Turkish tokenizer that employs a single \texttt{<uppercase>} token to fold casing into a shared root embedding. The Functionalizer generalizes these approaches into a fully parametric, multi-operator instruction set covering position, diacritic kind, and repeat count among other potential future extensions.
+
+\paragraph{Morphology-aware tokenization.} Morfessor \citep{creutz2002,creutz2007} performs unsupervised morpheme segmentation; MorphBPE \citep{asgari2025} constrains BPE merges to morpheme boundaries. The Functionalizer is complementary: where morphology-aware methods target linguistic structure, the Functionalizer targets orthographic surface variation, and the two could be composed.
+
+\paragraph{Tokenization-free models.} ByT5 \citep{xue2022}, MrT5 \citep{mrt52024}, and MegaByte \citep{yu2023} pursue orthographic robustness by operating on raw bytes or characters, at the cost of much longer sequences. The Functionalizer moves towards similar invariance while retaining subword granularity and avoiding the sequence-length penalty on code.
+
+\paragraph{Structured Unicode encoding.} SCRIPT-BPE \citep{script2025} re-encodes characters by Unicode script and category to remove cross-lingual bias. The normalization literature (e.g., \citealp{diacritics2024}) documents the downstream cost of inconsistent Unicode handling. The Functionalizer is complementary to both: a structured prefix scheme that can be layered on top of any existing pipeline.
+
+\section{The Functionalizer Framework}
+
+The Functionalizer establishes a parametric, lossless, prefix-based pre-tokenization framework. Instead of tokenizing raw surface forms directly, the framework decomposes orthographic and structural variations into a compositional sequence of non-destructive operators (opcodes) prepended to a canonical base token (operand). 
+
+By design, any transformation that is fully reversible (bijective) and can be mapped to character indices can be integrated as an operator within this framework. This includes not only capitalization and combining diacritics, but also structural transformations (e.g., character repetition). Potential future extensions include reversible morphological lemma folding, number/date normalization, prepending of whitespace, and machine learning preprocessing (e.g., correcting likely spelling errors). By isolating the parametric transformation from the semantic root, the framework enables downstream language models to process clean, shared canonical bases while preserving all orthographic details for lossless reconstruction.
+
+\subsection{PUA Instruction Layout}
+
+Instructions are prepended to the base token as a sequence of PUA codepoints, composed of an operator followed by numeric parameters:
+
+\begin{verbatim}
+[operator] [param_1] [param_2] ... -> [base_token]
+\end{verbatim}
+
+\begin{itemize}
+    \item \textbf{Numeric parameters} (\texttt{U+E000}--\texttt{U+E0FF}): encode integer values 0--255 (\texttt{value = codepoint - 0xE000}).
+    \item \textbf{Operators} (\texttt{U+E100}--\texttt{U+EFFF}): opcodes consuming a fixed number of parameters. Decoupling opcode from arguments leaves the full plane available for future operators.
+\end{itemize}
+
+\subsection{Encoding and Reversibility}
+
+The transformation pipeline is designed to be fully bijective, ensuring lossless recovery of the original string. For example:
+
+\paragraph{Encode:}
+\begin{enumerate}
+    \item Extract diacritic marks (generating serialization operators) and uppercase positions (generating \texttt{CAPITALIZE}).
+    \item Strip combining marks and lowercase the remaining characters.
+    \item Prepend the operator prefix.
+\end{enumerate}
+
+\paragraph{Decode:}
+\begin{enumerate}
+    \item Apply operators in reverse order to the base token, restoring diacritics and capitalization.
+    \item Remove the operator prefix, yielding the original string.
+\end{enumerate}
+
+Repeating text can be detected and encoded in the same way. In the decode order, repetition operators execute last: per-piece transforms (\texttt{CAPITALIZE}, diacritics) are applied first. All position parameters (including \texttt{pos} for \texttt{CAPITALIZE}/\texttt{REPEAT}, and \texttt{start}/\texttt{end} for \texttt{MULTIREPEAT}) refer to character positions \textbf{within their individual piece} (after applying any prior operations, but before expansion). The transform is bijective such that the original text is recovered exactly (see Table~\ref{tab:encoding_examples} in the Appendix for worked encoding examples). This fixed decoding sequence introduces a representation constraint: since per-piece transforms are applied first and then repeated, any capitalization or formatting is duplicated across all expanded units (for example, applying \texttt{CAPITALIZE(0)} to base \texttt{abc} and repeating it 3 times yields \texttt{AbcAbcAbc}, rather than heterogeneously cased units like \texttt{Abcabcabc}). In such heterogeneous cases, the encoder must fall back to an uncollapsed representation. While this limitation is minor in standard corpora, the framework could in theory be extended to support arbitrary decoding orders (e.g., left-to-right or right-to-left evaluation) to handle complex formatting combinations.
+
+\subsection{Pipeline Integration}
+
+We recommend that the Functionalizer should run on pre-split pieces, not raw text. With the current design, this is because operators address only the first 256 characters ($\text{pos} \le 255$). This can be extended to cover a larger index space in future iterations. From a more strategic level, this recommendation holds as it can allow a prepended operator/opcode sequence like ``capitalize the next character'' to be learned as one token during tokenization. 
+
+In this implementation's tests, the custom Split regex isolates each individual space character as a standalone space piece. The Functionalizer's \texttt{REPEAT} then aggregates consecutive identical space pieces back into a single opcode and one base space piece (e.g., 12 isolated space pieces $\rightarrow$ \texttt{[REPEAT(0,12)]} + space). Because each space is its own piece, the repetition collapse does not affect character offsets within adjacent word pieces. 
+
+By default (\texttt{split\_operators = true}), operators and parameters are emitted as separate tokens from the canonical base such that each operator and its parameters are tokenized independently. This allows the model to learn operator semantics and parameter distributions separately from the base token embeddings. Other options can be used to emit the entire operator sequence as a single token, which may be beneficial for certain downstream tasks.
+
+During vocabulary training, the BPE merge process is allowed to naturally merge these separate operator and parameter pieces back into combined tokens (such as merging \texttt{[CAPITALIZE]} and \texttt{[0]} into a single \texttt{[CAPITALIZE(0)]} token). In our experiments, BPE training naturally merges high-frequency operator-parameter pairs, which consumes extra vocabulary slots.
+
+\section{Current Operators and Expected Performance Profiles}
+
+\subsection{Current Operators Specification}
+
+The current implementation of the Functionalizer includes operators for capitalization, combining diacritics (detailed in Table~\ref{tab:diacritic_operators}), and character repetition (detailed in Table~\ref{tab:repetition_operators}).
+
+Each capitalization and diacritic variant is mapped to a dedicated 1-parameter operator in the \texttt{U+E100}--\texttt{U+E10F} space (last two reserved), consuming exactly one parameter (\texttt{pos}):
+
+\begin{table}[htbp]
+\centering
+\caption{Capitalization and Diacritic Operators Specification}
+\label{tab:diacritic_operators}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+\textbf{Operator / Opcode} & \textbf{Params} & \textbf{Action} \\
+\midrule
+\texttt{CAPITALIZE} (\texttt{U+E100}) & \texttt{pos} & Uppercase the character at \texttt{pos}. \\
+\texttt{TILDE} (\texttt{U+E101}) & \texttt{pos} & Apply combining tilde (\texttt{\textbackslash u\{0303\}}) to the character at \texttt{pos}. \\
+\texttt{ACUTE} (\texttt{U+E102}) & \texttt{pos} & Apply combining acute (\texttt{\textbackslash u\{0301\}}) to the character at \texttt{pos}. \\
+\texttt{GRAVE} (\texttt{U+E103}) & \texttt{pos} & Apply combining grave (\texttt{\textbackslash u\{0300\}}) to the character at \texttt{pos}. \\
+\texttt{CIRCUMFLEX} (\texttt{U+E104}) & \texttt{pos} & Apply combining circumflex (\texttt{\textbackslash u\{0302\}}) to the character at \texttt{pos}. \\
+\texttt{DIAERESIS} (\texttt{U+E105}) & \texttt{pos} & Apply combining diaeresis (\texttt{\textbackslash u\{0308\}}) to the character at \texttt{pos}. \\
+\texttt{MACRON} (\texttt{U+E106}) & \texttt{pos} & Apply combining macron (\texttt{\textbackslash u\{0304\}}) to the character at \texttt{pos}. \\
+\texttt{DOT\_ABOVE} (\texttt{U+E107}) & \texttt{pos} & Apply combining dot above (\texttt{\textbackslash u\{0307\}}) to the character at \texttt{pos}. \\
+\texttt{RING\_ABOVE} (\texttt{U+E108}) & \texttt{pos} & Apply combining ring above (\texttt{\textbackslash u\{030A\}}) to the character at \texttt{pos}. \\
+\texttt{DOUBLE\_ACUTE} (\texttt{U+E109}) & \texttt{pos} & Apply combining double acute (\texttt{\textbackslash u\{030B\}}) to the character at \texttt{pos}. \\
+\texttt{CARON} (\texttt{U+E10A}) & \texttt{pos} & Apply combining caron (\texttt{\textbackslash u\{030C\}}) to the character at \texttt{pos}. \\
+\texttt{COMMA\_BELOW} (\texttt{U+E10B}) & \texttt{pos} & Apply combining comma below (\texttt{\textbackslash u\{0326\}}) to the character at \texttt{pos}. \\
+\texttt{CEDILLA} (\texttt{U+E10C}) & \texttt{pos} & Apply combining cedilla (\texttt{\textbackslash u\{0327\}}) to the character at \texttt{pos}. \\
+\texttt{OGONEK} (\texttt{U+E10D}) & \texttt{pos} & Apply combining ogonek (\texttt{\textbackslash u\{0328\}}) to the character at \texttt{pos}. \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+Repetition operators start at \texttt{U+E200}:
+
+\begin{table}[htbp]
+\centering
+\caption{Repetition Operators Specification}
+\label{tab:repetition_operators}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+\textbf{Operator / Opcode} & \textbf{Params} & \textbf{Action} \\
+\midrule
+\texttt{REPEAT} (\texttt{U+E200}) & \texttt{pos}, \texttt{count} & Expand the character at \texttt{pos} to \texttt{count} copies. \\
+\texttt{MULTIREPEAT} (\texttt{U+E201}) & \texttt{start}, \texttt{end}, \texttt{count} & Expand the subsequence from \texttt{start} (inclusive) to \texttt{end} (exclusive) to \texttt{count} copies. \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{Expected Performance Profiles}
+
+We expect performance improvements and training dynamics to manifest in different ways depending on the function of the operator applied. While these effects can be greatly different depending on the operator, we present here two examples we expect to be representative of the current operator categories:
+
+\begin{enumerate}
+    \item \textbf{Semantic Invariance and Case Sharing (\texttt{CAPITALIZE}):} Casing variations typically do not alter the core semantic identity of a word (e.g., \texttt{hi} vs. \texttt{Hi} or \texttt{hello} vs. \texttt{Hello}). By extracting the capitalization operation to a parametric prefix, casing variants are collapsed into the same base token embedding. The downstream model shares parameter updates across all occurrences, boosting representation sharing and accelerating gradient updates.
+    \item \textbf{Structural Predictability and Compression (\texttt{REPEAT}):} In contrast, repetition operators target structural and syntactic formatting, most notably in programming languages. Repeated spaces or characters (e.g., indentation levels) are represented compactly by a single space character and a parameter value. This avoids fragmenting the sequence or vocabulary with many variants of whitespace blocks (e.g., \texttt{\ \ \ \ }, \texttt{\ \ \ \ \ \ \ \ }, \texttt{\ \ \ \ \ \ \ \ \ \ \ \ }). Consequently, repeated whitespace is rendered much more understandable and predictable for models, reducing context sequence lengths and enabling cleaner spatial representation of code block structures.
+\end{enumerate}
+
+\section{Experimental Setup}
+\label{sec:experimental_setup}
+
+\subsection{Pipelines and Configurations}\label{sec:pipelines}
+
+To clarify the mechanics of the test configurations, we define the primary components and flags used across our experimental pipelines:
+
+\begin{itemize}
+    \item \textbf{Unicode Normalization (\texttt{NFC})}: All tokenization configurations apply Unicode NFC (Normalization Form Canonical Composition) normalization to the raw input text prior to pre-tokenization. NFC standardizes all visual variations of pre-composed characters and decomposed character-combining mark sequences (such as different forms of accented characters) into a single, unified canonical composed character representation (e.g., composing decomposed \texttt{e + Combining Acute Accent} into the single pre-composed \texttt{é}). While not necessary, this can help reduce text variation and improve the efficiency of the Functionalizer's decomposition.
+    \item \textbf{Split Operators (\texttt{split\_operators})}: A configuration flag that determines whether prepended PUA operators (opcodes) and their numeric arguments (parameters) are split into independent string pieces before BPE subword training. For example, when enabled (\texttt{split\_operators = true}), BPE receives \texttt{[CAPITALIZE(0)]}, and \texttt{hello} as separate tokens rather than the fused sequence \texttt{[CAPITALIZE(0)]hello}. This prevents the vocabulary from memorizing fused operator-operand structures and allows the model to learn reusable, generalizable embeddings for the operators and arguments. When disabled, the prefix remains attached to the base word.
+    \item \textbf{Regex Splitting (\texttt{Split})}: Segments raw text into localized character runs (words, numbers, symbols, spaces, or newlines) prior to subword training. This pre-segmentation isolates indentation sequences and keeps character offset counts compact. We compare a custom regex splitter (\verb@\n+|\t+|[ ]| |[^\p{L}\p{N}\s _]+@) and the standard Llama 3 pattern (\texttt{LLAMA\_SPLIT\_PAT}).
+    \item \textbf{Functionalizer Decompositions}: Governed by three key parameters in the pre-tokenizer:
+    \begin{itemize}
+        \item \texttt{capitalize}: Identifies uppercase characters, generates a \texttt{CAPITALIZE(pos)} opcode, and lowercases the base character.
+        \item \texttt{serialize}: Detects combining diacritical marks, generates diacritic-specific opcodes (e.g., \texttt{ACUTE(pos)}), and strips the diacritics from the base character.
+        \item \texttt{repeat}: Identifies runs of 3+ consecutive identical pre-tokenized pieces (or 3+ identical characters within a single piece), collapses them to a single instance, and generates \texttt{REPEAT} or \texttt{MULTIREPEAT} opcodes. When upstream pre-tokenizers (e.g., the Split regex) isolate each space as its own piece, \texttt{repeat} aggregates those split pieces back into one opcode plus one base piece.
+    \end{itemize}
+\end{itemize}
+
+For all Functionalizer configurations, the corresponding decoder is configured to mirror the pre-tokenizer flags to ensure losslessness. For downstream language model training (Section~\ref{sec:results_training}) and downstream inference task evaluation (Section~\ref{sec:results_inference}), we evaluate \texttt{Split Only}, \texttt{Split + Functionalizer}, and \texttt{Split + Functionalizer (Repeat)} configurations.
+
+\subsection{Datasets, Vocabulary, and Tokenizer Metrics}\label{sec:datasets}
+
+We conduct experiments across six distinct natural language and source code corpora:
+\begin{itemize}
+    \item \textbf{Prose}: Wikitext (\texttt{Salesforce/wikitext-2-raw-v1}), TinyStories (\texttt{roneneldan/TinyStories}).
+    \item \textbf{Source Code}: Python-Codes (\texttt{flytech/python-codes-25k}) and CodeSearchNet (\texttt{CSN-Python}, \texttt{CSN-Java}, \texttt{CSN-Go}).
+\end{itemize}
+
+We train tokenizers with target vocabulary sizes of \textbf{128k}. All of our chosen corpora are exhausted before reaching the 128k target. This means that training continues until no further BPE merges can be performed, representing corpus exhaustion.
+
+To evaluate vocabulary efficiency and compression directly at the tokenizer level, we track two metrics:
+\begin{enumerate}
+    \item \textbf{Token Compression (Chars/Token)}: The average number of visual characters represented per token. A higher ratio indicates stronger text compression and shorter sequence lengths.
+    \item \textbf{Vocab Diff (\%)}: The percentage reduction in actual vocabulary size achieved by the Functionalizer under unconstrained/exhaustion conditions (\texttt{actual\_vocab\_size < target\_vocab\_size}), which measures the framework's ability to cover the same corpus with a smaller vocabulary.
+\end{enumerate}
+
+\subsection{Downstream Training and Evaluation}\label{sec:downstream_eval}
+
+To assess downstream performance, we train a GPT-2 model (6 layers, 512 embedding dim, 8 attention heads, 16k target vocabulary, $\sim$25M parameters) on each configuration.
+
+\begin{itemize}
+    \item \textbf{Training Details}: Trained with a batch size of 16, a learning rate of 5e-4, an AdamW optimizer (weight decay 0.01), a linear learning rate schedule with 200 warmup steps decaying to zero, gradient clipping at 1.0, and a context length of 256 tokens. Training runs for 5,000 steps. Training is repeated across five distinct seeds: \texttt{10}, \texttt{42}, \texttt{100}, \texttt{2026}, and \texttt{7}.
+    \item \textbf{Inference Downstream Prompts}: Evaluated on 100 validation prompts per dataset. Generation uses greedy decoding up to 50 new tokens (for natural language) or 64 new tokens (for source code).
+    \item \textbf{Downstream Evaluation Metrics}:
+    \begin{itemize}
+        \item \textbf{Per-Character Perplexity (Char PPL)}: A normalized measure of language modeling loss to enable direct comparison across tokenizers with differing token lengths. Because tokenizers partition the same text into different numbers of tokens, comparing token-level perplexity is unfair (tokenizers with shorter tokens will show artificially lower perplexity). To normalize, we convert the average token-level cross-entropy loss ($\mathcal{L}_{\text{token}}$) to character-level cross-entropy loss ($\mathcal{L}_{\text{char}}$) using the corpus-level average character-to-token ratio ($R_{\text{char/token}} = \frac{N_{\text{chars}}}{N_{\text{tokens}}}$):
+        \begin{equation}
+            \mathcal{L}_{\text{char}} = \frac{\mathcal{L}_{\text{token}}}{R_{\text{char/token}}}
+        \end{equation}
+        The per-character perplexity is then computed as:
+        \begin{equation}
+            \text{PPL}_{\text{char}} = \exp\left(\mathcal{L}_{\text{char}}\right) = \exp\left(\frac{\mathcal{L}_{\text{token}}}{R_{\text{char/token}}}\right)
+        \end{equation}
+        This ensures that character perplexity represents a fair, tokenizer-independent metric of information density.
+        \item \textbf{Throughput (Chars/Sec)}: During training, this is computed as the total tokens processed multiplied by the dataset's average character-to-token ratio (based on raw text length including all spaces and formatting) divided by total training time. During inference, this text speed is calculated on the reconstructed decoded string length (including spaces and newlines, with PUA opcodes decoded back to standard characters) divided by the coherent generation time. To prevent collapsed models from scoring artificially high throughput, this speed is computed exclusively over the sequence prefix generated prior to any repetition collapse (i.e., before any single token repeats $>3$ times consecutively).
+        \item \textbf{Average Tokens Pre-Collapse}: The average number of tokens generated before a single token repeats consecutively more than three times (the threshold for pathological loop collapse). This measures the length of coherent sequence generation before degeneration.
+        \item \textbf{Coherence (1 - Repetition)}: For prose, the percentage of generated sequences free of pathological n-gram loops. If the model produces an empty or whitespace-only sequence, it is tracked as 0\% coherent.
+        \item \textbf{Syntax Success Rate}: For source code, the percentage of generations that parse cleanly under Python's \texttt{ast.parse} or Go's \texttt{gofmt}. Empty generations (or whitespace only) are counted as failures.
+        \item \textbf{\% Empty}: The percentage of generated sequences that are empty or contain only whitespace, metaspace, or raw PUA control characters. While empty sequences are classified as failures for quality metrics (coherence and syntax success), their tokens and generation time are still fully accounted for in the throughput and speed calculations.
+    \end{itemize}
+\end{itemize}
+
+\section{Results}
+
+\subsection{Tokenizer Metrics}\label{sec:results_tokenizer}
+
+To analyze vocabulary usage, token compression, and unconstrained vocabulary requirements (corpus exhaustion), we evaluate configurations across all six datasets. Table~\ref{tab:tokenizer_metrics} presents consolidated metrics at the \textbf{128k target vocabulary size} (which represents the unconstrained/corpus exhaustion regime where the tokenizer's bounds are determined by corpus entropy rather than a hard limit). Each configuration consists of a \textbf{Base} version (without decomposition) and a \textbf{Functionalizer} version (with decomposition). The configurations labeled as \texttt{(Repeat)} (e.g. Split Only (Repeat) or Split + Functionalizer (Repeat)) represent baseline and Functionalizer configurations where only the character repetition operators (\texttt{REPEAT}, \texttt{MULTIREPEAT}) are active, while capitalization and diacritic serialization operators are disabled.
+
+\begin{table*}[t]
+\centering
+\caption{Tokenizer Metrics at 128k Target Vocabulary (Corpus Exhaustion)}
+\label{tab:tokenizer_metrics}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrcc}
+\toprule
+\textbf{Dataset} & \textbf{Pipeline Config} & \textbf{Vocab (Base)} & \textbf{Vocab (Func)} & \textbf{Vocab Diff} & \textbf{Chars/Token (Base)} & \textbf{Chars/Token (Func)} \\
+\midrule
+\textbf{Wikitext} & Split Only & 51,780 & 43,700 & $-15.60\%$ & 2.4704 & 2.2659 \\
+ & Split Only (Repeat) & 51,780 & 52,013 & $+0.45\%$ & 2.4704 & 2.4750 \\
+ & Llama Split & 53,262 & 45,714 & $-14.17\%$ & 4.2189 & 3.6215 \\
+\midrule
+\textbf{Python-Codes} & Split Only & 33,399 & 28,017 & $-16.11\%$ & 2.1984 & 2.3070 \\
+ & Split Only (Repeat) & 33,399 & 33,445 & $+0.14\%$ & 2.1984 & 2.4362 \\
+ & Llama Split & 37,181 & 31,280 & $-15.87\%$ & 3.7522 & 3.2600 \\
+\midrule
+\textbf{TinyStories} & Split Only & 14,280 & 12,853 & $-9.99\%$ & 2.2937 & 2.1553 \\
+ & Split Only (Repeat) & 14,280 & 14,665 & $+2.70\%$ & 2.2937 & 2.2919 \\
+ & Llama Split & 16,981 & 15,639 & $-7.90\%$ & 4.2100 & 3.7533 \\
+\midrule
+\textbf{CSN-Python} & Split Only & 94,605 & 82,575 & $-12.72\%$ & 1.8928 & 2.5848 \\
+ & Split Only (Repeat) & 94,605 & 94,243 & $-0.38\%$ & 1.8928 & 2.7177 \\
+ & Llama Split & 90,834 & 77,785 & $-14.37\%$ & 4.0416 & 3.4345 \\
+\midrule
+\textbf{CSN-Java} & Split Only & 62,436 & 54,371 & $-12.92\%$ & 2.1356 & 2.3325 \\
+ & Split Only (Repeat) & 62,436 & 62,257 & $-0.29\%$ & 2.1356 & 2.6693 \\
+ & Llama Split & 84,810 & 76,664 & $-9.60\%$ & 4.2262 & 3.1723 \\
+\midrule
+\textbf{CSN-Go} & Split Only & 15,735 & 15,281 & $-2.89\%$ & 1.9750 & 1.8464 \\
+ & Split Only (Repeat) & 15,735 & 15,672 & $-0.40\%$ & 1.9750 & 1.9699 \\
+ & Llama Split & 20,458 & 20,125 & $-1.63\%$ & 2.6201 & 2.3779 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\subsubsection*{Key Insights and Analysis}
+
+\textbf{Distinct vocabulary and corpus exhaustion.} At the 128k target scale, all of our datasets saturate before reaching the maximum vocabulary size, leading to corpus exhaustion. Table~\ref{tab:tokenizer_metrics} demonstrates that when unconstrained by a target vocabulary limit, the collapse of formatting variants allows the Functionalizer to achieve complete corpus coverage with a significantly smaller total vocabulary size. The necessary vocabulary size drops by up to \textbf{16\%} on standard configurations:
+\begin{itemize}
+    \item \textbf{Wikitext}: Reduces by \textbf{15.60\%} (43,700 vs. 51,780).
+    \item \textbf{Python-Codes}: Reduces by \textbf{16.11\%} (28,017 vs. 33,399).
+    \item \textbf{TinyStories}: Reduces by \textbf{9.99\%} (12,853 vs. 14,280).
+    \item \textbf{CSN-Python}: Reduces by \textbf{12.72\%} (82,575 vs. 94,605).
+    \item \textbf{CSN-Java}: Reduces by \textbf{12.92\%} (54,371 vs. 62,436).
+\end{itemize}
+
+On \textbf{CSN-Go}, the unconstrained vocabulary reduction is minor (\textbf{2.89\%}), matching the minimal casing and repetition structure targeted by the operators.
+
+\textbf{Token compression: the domain split.} The character-to-token ratio (Chars/Token) in Table~\ref{tab:tokenizer_metrics} reveals a sharp division between prose and code.
+\begin{itemize}
+    \item \textbf{Prose}: On Wikitext and TinyStories, the Functionalizer reduces the Chars/Token ratio (resulting in a \textbf{+6.42\% to +16.50\%} token inflation across configurations, or \textbf{+6.42\% to +9.02\%} on standard splits). This sequence length cost occurs because natural language prose lacks the long repeated sequences that \texttt{REPEAT} collapses, meaning the casing operators represent a net sequence length overhead.
+    \item \textbf{Source Code}: On CSN-Python and CSN-Java, the Functionalizer substantially increases the Chars/Token ratio, compressing sequence lengths. This compression saves up to \textbf{26.77\%} in tokens on CSN-Python and \textbf{8.44\%} on CSN-Java (increasing up to \textbf{30.35\%} and \textbf{19.99\%} respectively when considering repetition collapse only). This is driven by indentation collapse, where long space runs are collapsed into a single character plus a \texttt{REPEAT} operator.
+\end{itemize}
+
+\textbf{The Llama Split Code Inflation.} 
+While custom Split configurations compress source code, the \textbf{Llama Split} configuration exhibits the opposite behavior, showing sequence length inflation on both CSN-Python (\textbf{+17.67\%} token inflation, with Chars/Token dropping from 4.0416 to 3.4345) and CSN-Java (\textbf{+33.22\%} token inflation, with Chars/Token dropping from 4.2262 to 3.1723). This sequence inflation occurs because the Llama split regex does not isolate spaces from adjacent word pieces, which prevents the Functionalizer's \texttt{REPEAT} operator from collapsing indentation blocks. Consequently, the casing operators introduce a net token overhead without any offsetting spatial compression. This sensitivity highlights that the Functionalizer's compression effectiveness is tightly coupled to the split regex of the base tokenizer, which we flag as a key area for follow-up research.
+
+\textbf{The Go Indentation and CamelCase Exception.}
+\textbf{CSN-Go} acts as the clearest exception to the source code compression rule. As shown in Table~\ref{tab:tokenizer_metrics}, the Functionalizer inflates Go sequence lengths by \textbf{+6.97\%} (reduced Chars/Token). This occurs because:
+\begin{enumerate}
+    \item Go's standard formatter (\texttt{gofmt}) enforces tab-based indentation instead of spaces. Tabs are already single-character tokens in BPE, leaving no long space runs for \texttt{REPEAT} to compress.
+    \item Go's strict CamelCase conventions for exported functions and identifiers lead to a high frequency of uppercase transitions, which translates to a high frequency of \texttt{CAPITALIZE} operators without corresponding compression.
+\end{enumerate}
+This exception demonstrates that the Functionalizer's sequence efficiency is highly predictable and depends entirely on the presence of the orthographic structures its operators are designed to target.
+
+\subsection{Training Dynamics and Language Modeling Performance}\label{sec:results_training}
+
+We analyze the training behavior and next-token prediction performance of the $\sim$25M parameter GPT-2 model under each tokenizer configuration. Table~\ref{tab:training} summarizes the training metrics across TinyStories, CSN-Python, and CSN-Go, averaged over five random seeds.
+
+\begin{table*}[t]
+\centering
+\caption{Training Dynamics and Language Modeling Metrics (5 Seeds). Inflation metrics are calculated from unrounded raw token counts.}
+\label{tab:training}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrcrccc}
+\toprule
+\textbf{Tokenizer Type} & \textbf{Vocab Size} & \textbf{Chars/Token} & \textbf{Inflation} & \textbf{Tokens/Sec} & \textbf{Chars/Sec} & \textbf{Final Loss} & \textbf{Token PPL} & \textbf{Char PPL} \\
+\midrule
+\multicolumn{9}{l}{\textbf{Dataset: TinyStories}} \\
+Split Only & 14,280 & 2.295 & $0.00\%$ & $55498.7 \pm 661.8$ & $127354.4 \pm 1518.5$ & $1.4980 \pm 0.0048$ & $4.47 \pm 0.02$ & $1.9209 \pm 0.0040$ \\
+Split + Functionalizer & 12,853 & 2.156 & $+6.45\%$ & $53675.9 \pm 1568.6$ & $115705.6 \pm 3381.3$ & $1.4402 \pm 0.0011$ & $4.22 \pm 0.00$ & $1.9506 \pm 0.0010$ \\
+Split + Functionalizer (Repeat) & 14,665 & 2.294 & $+0.03\%$ & $54220.7 \pm 2187.0$ & $124387.2 \pm 5017.1$ & $1.5125 \pm 0.0023$ & $4.54 \pm 0.01$ & $1.9335 \pm 0.0020$ \\
+\midrule
+\multicolumn{9}{l}{\textbf{Dataset: CSN-Python}} \\
+Split Only & 16,000 & 1.901 & $0.00\%$ & $52237.9 \pm 17.3$ & $99306.9 \pm 33.0$ & $2.5551 \pm 0.0041$ & $12.87 \pm 0.05$ & $3.8345 \pm 0.0082$ \\
+Split + Functionalizer & 16,000 & 2.620 & $-27.44\%$ & $54584.6 \pm 19.9$ & $143018.9 \pm 52.3$ & $3.1686 \pm 0.0040$ & $23.77 \pm 0.10$ & $3.3512 \pm 0.0052$ \\
+Split + Functionalizer (Repeat) & 16,000 & 2.771 & $-31.39\%$ & $55470.3 \pm 25.3$ & $153699.3 \pm 70.0$ & $3.3496 \pm 0.0049$ & $28.49 \pm 0.14$ & $3.3498 \pm 0.0059$ \\
+\midrule
+\multicolumn{9}{l}{\textbf{Dataset: CSN-Go}} \\
+Split Only & 15,735 & 2.226 & $0.00\%$ & $60367.7 \pm 23.3$ & $134352.3 \pm 51.8$ & $2.8526 \pm 0.0093$ & $17.33 \pm 0.16$ & $3.6029 \pm 0.0151$ \\
+Split + Functionalizer & 15,281 & 1.959 & $+13.63\%$ & $60554.2 \pm 36.4$ & $118598.1 \pm 71.3$ & $2.6738 \pm 0.0066$ & $14.50 \pm 0.10$ & $3.9166 \pm 0.0133$ \\
+Split + Functionalizer (Repeat) & 15,672 & 2.224 & $+0.07\%$ & $60627.7 \pm 30.9$ & $134833.6 \pm 68.8$ & $2.8677 \pm 0.0085$ & $17.60 \pm 0.15$ & $3.6308 \pm 0.0139$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\subsubsection*{Key Insights and Analysis}
+
+\textbf{Analyzing Per-Character Perplexity (Char PPL).} Because sequence lengths differ under different tokenizers, Token Perplexity (Token PPL) is not directly comparable. We therefore compute the Per-Character Perplexity (Char PPL) as a normalized measure of language modeling performance.
+\begin{itemize}
+    \item \textbf{CSN-Python (Source Code)}: The Functionalizer configurations consistently and significantly outperform their baseline counterparts. For instance, the \textbf{Split + Functionalizer} achieves a Char PPL of \textbf{3.3512} compared to the \textbf{Split Only} baseline at \textbf{3.8345} (a relative improvement of \textbf{12.6\%}). This indicates that collapsing space runs into simple structural parameters makes code indentation structures highly predictable, boosting the model's overall representational capability.
+    \item \textbf{CSN-Go (Source Code)}: Go represents the counter-case. Due to tab indentation (which already behaves as clean single-character tokens in BPE) and capital-dense CamelCase exports, the Functionalizer inflates Go sequence lengths without substantial offsetting compression (causing a +13.63\% sequence inflation). Consequently, Char PPL degrades under the Go configuration (e.g., \textbf{3.9166} for Split + Functionalizer vs. \textbf{3.6029} for Split Only).
+    \item \textbf{TinyStories (Prose)}: Consistent with the sequence inflation on prose (+6.45\%), the Split + Functionalizer experiences a minor Char PPL degradation (1.9506 vs. 1.9209).
+\end{itemize}
+
+\textbf{Computational Throughput.}
+The Functionalizer can improve character level throughput for certain corpora.
+\begin{itemize}
+    \item \textbf{Throughput (Chars/Sec)}: The Functionalizer significantly increases content throughput (Chars/Sec) on corpora where it reduces sequence length. For example, on CSN-Python, the Split + Functionalizer generates \textbf{143,018.9 chars/sec} compared to \textbf{99,306.9 chars/sec} for Split Only. This represents a \textbf{44.0\%} increase in content throughput. This gain is driven primarily by the higher chars/token ratio achieved through sequence compression: raw token generation rates (Tokens/Sec) remain comparable across all configurations ($\sim$52,000--62,000 tokens/sec), so more characters are delivered per generated token rather than more tokens per second. On prose (TinyStories), character throughput slightly decreases (\textbf{115,705.6} vs. \textbf{127,354.4 chars/sec}), in line with the sequence length cost.
+\end{itemize}
+
+\subsection{Downstream Inference and Downstream Tasks}\label{sec:results_inference}
+
+We perform greedy decoding evaluations on validation prompts to assess inference latency and text generation success. Table~\ref{tab:inference} lists the results (Part a for prose, Part b for code).
+
+\begin{table*}[t]
+\centering
+\caption{Downstream Inference Metrics (100 Prompts, 5 Seeds)}
+\label{tab:inference}
+
+\textbf{(a) Prose Generation Metrics} \\
+\vspace{0.5em}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccr}
+\toprule
+\textbf{Tokenizer Type} & \textbf{Avg Tokens} & \textbf{Avg Tokens Pre-Collapse} & \textbf{Avg Chars} & \textbf{Tokens / Sec} & \textbf{Chars / Sec (Text Speed)} & \textbf{\% Empty} & \textbf{Coherence (1 $-$ Rep.) (\%)} \\
+\midrule
+\multicolumn{8}{l}{\textbf{Dataset: TinyStories (Prose Generation)}} \\
+Split Only & $7.6 \pm 0.5$ & $3.6 \pm 0.5$ & $17.4 \pm 1.6$ & $303.0 \pm 16.0$ & $1117.9 \pm 42.8$ & $1.0 \pm 0.0\%$ & $99.00 \pm 0.00\%$ \\
+Split + Functionalizer & $15.7 \pm 1.1$ & $11.7 \pm 1.1$ & $40.1 \pm 4.0$ & $311.0 \pm 3.3$ & $954.5 \pm 28.2$ & $2.2 \pm 1.2\%$ & $97.80 \pm 1.17\%$ \\
+Split + Functionalizer (Repeat) & $7.4 \pm 0.3$ & $3.4 \pm 0.3$ & $16.6 \pm 0.9$ & $307.2 \pm 6.1$ & $1134.5 \pm 25.2$ & $1.0 \pm 0.0\%$ & $99.00 \pm 0.00\%$ \\
+\bottomrule
+\end{tabular}%
+}
+
+\vspace{1.5em}
+
+\textbf{(b) Source Code Generation Metrics} \\
+\vspace{0.5em}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccr}
+\toprule
+\textbf{Tokenizer Type} & \textbf{Avg Tokens} & \textbf{Avg Tokens Pre-Collapse} & \textbf{Avg Chars} & \textbf{Tokens / Sec} & \textbf{Chars / Sec (Text Speed)} & \textbf{\% Empty} & \textbf{Syntax Success Rate (\%)} \\
+\midrule
+\multicolumn{8}{l}{\textbf{Dataset: CSN-Python (Code Generation)}} \\
+Split Only & $6.0 \pm 1.3$ & $2.0 \pm 1.3$ & $7.9 \pm 2.4$ & $313.3 \pm 6.0$ & $626.7 \pm 79.1$ & $52.0 \pm 25.7\%$ & $0.00 \pm 0.00\%$ \\
+Split + Functionalizer & $9.1 \pm 1.1$ & $5.1 \pm 1.1$ & $15.6 \pm 3.1$ & $316.8 \pm 2.9$ & $507.6 \pm 200.1$ & $77.6 \pm 11.6\%$ & \textbf{9.20 $\pm$ 9.00\%} \\
+Split + Functionalizer (Repeat) & $7.3 \pm 0.2$ & $3.3 \pm 0.2$ & $12.1 \pm 0.6$ & $317.5 \pm 4.1$ & $769.8 \pm 25.2$ & $92.6 \pm 2.9\%$ & $0.00 \pm 0.00\%$ \\
+\midrule
+\multicolumn{8}{l}{\textbf{Dataset: CSN-Go (Code Generation)}} \\
+Split Only & $8.5 \pm 3.7$ & $4.6 \pm 3.8$ & $10.6 \pm 6.1$ & $314.6 \pm 3.3$ & $401.1 \pm 74.1$ & $73.2 \pm 23.7\%$ & $2.20 \pm 3.12\%$ \\
+Split + Functionalizer & $10.7 \pm 7.6$ & $7.0 \pm 8.2$ & $13.6 \pm 11.3$ & $314.6 \pm 1.9$ & $431.5 \pm 28.4$ & $71.8 \pm 26.3\%$ & \textbf{4.00 $\pm$ 4.65\%} \\
+Split + Functionalizer (Repeat) & $9.9 \pm 3.9$ & $6.1 \pm 4.0$ & $13.4 \pm 7.4$ & $312.2 \pm 4.7$ & $436.9 \pm 81.8$ & $67.6 \pm 21.7\%$ & $2.80 \pm 4.17\%$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\subsubsection*{Key Insights and Analysis}
+
+\textbf{Downstream Code Generation Syntax Success Rate.}
+One of our most striking results is the impact of decomposition on source code syntax validity under highly limited model size. At the 25M parameter GPT-2 scale, models struggle to learn basic syntax and indentation, as evidenced by the zero success rates of standard tokenizers on CSN-Python (e.g., \textbf{0.00\%} for Split Only).
+
+By contrast, integrating the Functionalizer pre-tokenizer drastically improves the model's capacity to output valid code syntax at this scale. The \textbf{Split + Functionalizer} configuration reaches a syntax success rate of \textbf{9.20\%} (compared to \textbf{0.00\%} for the Split Only baseline). The custom \texttt{Split} regex preserves newlines (\texttt{\textbackslash n}) and tabs (\texttt{\textbackslash t}) losslessly, allowing the model to process multi-line sequences. In this setup, the standard Split pre-tokenizer splits the space character from adjacent words, which allows the \texttt{REPEAT} operator to fully aggregate the run of consecutive spaces (e.g., 4 spaces collapse to \texttt{\textbackslash ue200\textbackslash ue000\textbackslash ue004} and a space). We note that these syntax success rates carry substantial variance across seeds (e.g., \textbf{9.20 $\pm$ 9.00\%}), reflecting sensitivity to weight initialization at this model scale; the consistent direction of improvement of the Functionalizer configuration on CSN-Python, however, supports the pattern as a real effect rather than noise. This indicates that by reducing the cognitive load of structural whitespace into deterministic, parameter-based instructions, small language models can generate syntactically sound structures that compile/parse. This does not mean that the results are production-ready, but it does suggest that the Functionalizer can help small models learn to represent and generate structured content more effectively.
+
+\textbf{Coherent Generation Length (Avg Tokens Pre-Collapse).}
+A critical challenge in low-parameter language modeling is the tendency to fall into early pathological looping or generation collapse (e.g., repeating spaces, newlines, or specific phrases infinitely). In Table~\ref{tab:inference}, we track the average number of tokens generated before a single token repeats consecutively more than three times (\textit{Avg Tokens Pre-Collapse}). We find that models trained with the Functionalizer generate substantially longer sequences before collapsing. For example, on the \textbf{TinyStories} prose dataset, the Split + Functionalizer model generates an average of \textbf{11.7} tokens pre-collapse compared to only \textbf{3.6} tokens for the Split Only baseline. Similarly, on \textbf{CSN-Python}, the Functionalizer increases pre-collapse tokens from \textbf{2.0} to \textbf{5.1}, and on \textbf{CSN-Go} from \textbf{4.6} to \textbf{7.0}. When paired with similar coherence levels on prose (e.g., 97.80\% vs. 99.00\%) and significantly higher syntax success rates on code, these metrics indicate that the Functionalizer allows the model to produce longer content without degenerating. While we avoid making definitive causal claims, this behavior suggests that by offloading surface variations, the model can maintain a more stable context representation over longer generation sequences, which may correlate with better representation learning or training dynamics.
+
+\textbf{Downstream Latency and Generation Speed.}
+During inference generation (which is autoregressive and token-by-token), we observe mixed results in generation speed in terms of actual content (characters generated per second).
+On CSN-Go, the Split + Functionalizer configuration achieves a text speed of \textbf{431.5 chars/sec} compared to \textbf{401.1 chars/sec} for Split Only (a \textbf{7.6\%} speedup).
+For configurations targeting repetition only (Split + Functionalizer (Repeat)), we observe more consistent improvements: on CSN-Python, it generates \textbf{769.8 chars/sec} compared to \textbf{626.7 chars/sec} for Split Only (a \textbf{22.8\%} speedup), and on TinyStories it generates \textbf{1134.5 chars/sec} compared to \textbf{1117.9 chars/sec} (a \textbf{1.5\%} speedup).
+However, the full Split + Functionalizer configuration is slower on TinyStories (\textbf{954.5 chars/sec}) and CSN-Python (\textbf{507.6 chars/sec}) compared to the Split Only baseline, reflecting the sequence length overhead of casing operators when they are not offset by structural compression.
+We note that the raw generation speeds during inference are orders of magnitude lower than the training throughput metrics reported in Table~\ref{tab:training}. This discrepancy is expected and stems from the difference in computation modes.
+
+\section{Discussion}\label{sec:discussion}
+
+The tokenizer-level results support a specific, bounded claim: \textbf{the Functionalizer is a vocabulary-efficiency and code-compression tool, not a universal improvement.} It eliminates casing-induced vocabulary fragmentation and shortens code sequences substantially (token usage), at the price of longer prose sequences. For a code-domain tokenizer, this tradeoff is clearly favorable; for prose-dominant workloads, the value depends on downstream gains not yet demonstrated at production scale.
+
+\textbf{The Serving Cost and Sequence Length Trade-off.} 
+A critical open question is the trade-off between vocabulary size reduction and sequence length inflation. Under modern LLM deployment paradigms, inference is frequently bottlenecked by memory bandwidth, where serving costs and latencies scale with context sequence length (driven by KV cache size and attention computation overhead). In this light, a \textbf{6--9\%} sequence length inflation on prose represents a non-trivial penalty. Conversely, a \textbf{9--16\%} (excepting Go) reduction in vocabulary size reduces the model's embedding parameters, which can decrease peak memory footprint and training requirements. Characterizing the exact boundary where vocabulary slot savings outweigh sequence length inflation, under varying hardware constraints (compute-bound training vs. memory-bandwidth-bound inference), remains an important open question for future research.
+
+The preliminary inference results in Section~\ref{sec:results_inference} are consistent with the vocabulary compaction story. The Functionalizer matches Split Only coherence on prose while achieving higher vocabulary efficiency. With that said, a 25M parameter model at short generation lengths is insufficient to validate or invalidate any production scale hypothesis. The open questions are squarely enumerated in Subsection~\ref{sec:limitations}.
+
+It is also worth noting that at this small model scale (25M parameters) and short context length (maximum 50--64 generated tokens), the computation time is not the primary bottleneck during inference. Host-device synchronization (e.g., retrieving the token ID via blocking CPU-GPU calls) and CUDA kernel launch overhead dominate the latency. Consequently, hardware-level optimizations like Key-Value (KV) caching yield negligible differences in generation throughput at this scale. The reported downstream speeds reflect these systemic overhead constraints, and we expect the relative generation speedups of Functionalizer configurations to widen as model parameters and generation sequence lengths scale up.
+
+Additionally, we expect that as more operators are implemented within the Functionalizer framework, they could further improve performance, especially when training models on specific tasks.
+
+\subsection{Limitations}
+\label{sec:limitations}
+
+\begin{enumerate}
+    \item \textbf{Downstream evaluation is preliminary.} Inference results are at $\sim$25M parameters (Section~\ref{sec:results_inference}). The vocabulary compression$\rightarrow$performance link is not validated at production scale, where we expect gains may shift to training and inference efficiency rather than test performance.
+    \item \textbf{Prose costs sequence length.} Up to +9\% more tokens on Wikitext at 128k. For prose-dominant workloads this is a net cost unless offset by downstream gains not yet shown.
+    \item \textbf{256-character position limit.} Transforms beyond index 255 are silently dropped; runs of $\ge$256 identical characters are not collapsed. Rare in practice, but a hard boundary under adversarial or unusual inputs. Bumping the starting codepoints of the operators to higher PUA sub-blocks (e.g., shifts starting at \texttt{U+EA00} and \texttt{U+EB00}) would expand the numeric parameter range and mitigate this constraint, though we do not focus on this extension in the current work.
+    \item \textbf{Fixed diacritic coverage.} The serialization framework supports 13 combining marks. Scripts and marks outside this set fall back to non-functionalizer behavior.
+    \item \textbf{Pareto frontier uncharacterised.} We measure vocabulary size and token usage independently; we do not characterise the joint tradeoff or its interaction with model size.
+    \item \textbf{Incomplete operator ablations.} Beyond some tests with repetition only, we did not isolate the individual contribution of each operator (e.g., casing vs. repetition) in our downstream evaluations.
+\end{enumerate}
+
+\subsection{Future Work}
+\label{sec:future_work}
+
+While our preliminary evaluations establish the feasibility and efficiency of functional decomposition, several promising directions remain to expand the framework:
+
+\begin{itemize}
+    \item \textbf{Production-Scale Validation:} The most critical next step is extending downstream training and inference validation to standard LLM scales (1B+ parameters). This will evaluate whether the vocabulary compression gains translate directly to training throughput, data efficiency, and downstream task accuracy (especially on casing-sensitive tasks like Named Entity Recognition).
+    \item \textbf{Richer Operator Sets:} Expanding and validating advanced bijective operators, including:
+    \begin{itemize}
+        \item \emph{Morphological Lemma Folding:} Factoring morphological inflection markers (e.g., \texttt{[PLURAL]}, \texttt{[PAST\_TENSE]}) from canonical base lemmas to compress morphologically rich languages.
+        \item \emph{Structured Pattern Folding:} Factoring structured data runs (e.g., dates, IP addresses, hashes) into parameterized instructions over base operand tokens.
+        \item \emph{Lossless Spelling Normalization:} Factoring minor typographical errors into parameterized edit operators applied to shared base roots.
+    \end{itemize}
+\end{itemize}
+
+\section{Conclusion}
+
+The Functionalizer factors orthographic and structural variation out of the subword tokenizer vocabulary into a compositional, parametric opcode/operand prefix stream encoded in the Unicode Private Use Area. By isolating surface variations from semantic roots, the framework achieves complete corpus coverage with much smaller vocabularies under unconstrained conditions, reducing actual vocabulary slot requirements by up to \textbf{16\%} (averaging \textbf{11.7\%} fewer slots overall across split only vs split + functionalizer configurations and datasets).
+
+Downstream training and evaluation on 25M parameter language models reveal a domain-dependent tradeoff: on indentation-dense code, the Functionalizer delivers substantial sequence-length compression, improves next-token predictability, and drastically improves code generation syntax validity (from near-zero for standard baselines up to \textbf{9.20\%}). On natural-language prose, the casing operators introduce a minor sequence length cost (+6\% to +9\%) which degrades generation speed (showing a 14.6\% slowdown), though the repetition-only configuration (Split + Functionalizer (Repeat)) maintains a minor 1.5\% speedup on TinyStories (while matching baseline coherence). On CSN-Python code generation, the repetition-only configuration yields a substantial speedup of 22.8\% (at the cost of a higher empty generation rate). 
+
+While production-scale validation remains an open question, these preliminary results demonstrate that factoring orthographic complexity out of tokenizers is a viable path toward vocabulary-efficient, structurally aware language modeling.
+
+\appendix
+\section{Worked Encoding Examples}
+
+\begin{table}[htbp]
+\centering
+\caption{Worked Encoding Examples}
+\label{tab:encoding_examples}
+\begin{tabular}{llll}
+\toprule
+\textbf{Input} & \textbf{Operators} & \textbf{Base} & \textbf{Encoded prefix} \\
+\midrule
+\texttt{Hello} & \texttt{CAPITALIZE(0)} & \texttt{hello} & \texttt{\textbackslash u\{E100\}\textbackslash u\{E000\}} \\
+\texttt{H\'{e}llo} & \texttt{ACUTE(1) CAPITALIZE(0)} & \texttt{hello} & \texttt{\textbackslash u\{E102\}\textbackslash u\{E001\}\textbackslash u\{E100\}\textbackslash u\{E000\}} \\
+\texttt{\#\#\#\#\#\#} & \texttt{REPEAT(0, 6)} & \texttt{\#} & \texttt{\textbackslash u\{E200\}\textbackslash u\{E000\}\textbackslash u\{E006\}} \\
+\texttt{\ \ \ \ } (4 spaces) & \texttt{REPEAT(0, 4)} & \texttt{\ } & \texttt{\textbackslash u\{E200\}\textbackslash u\{E000\}\textbackslash u\{E004\}} \\
+\texttt{abcabcabc} & \texttt{MULTIREPEAT(0, 3, 3)} & \texttt{abc} & \texttt{\textbackslash u\{E201\}\textbackslash u\{E000\}\textbackslash u\{E003\}\textbackslash u\{E003\}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{Data and Code Availability}
+
+All tokenizer configurations, training scripts, evaluation pipelines, dataset acquisition scripts, and result files are publicly available at \url{https://github.com/connor-makowski/functionalizer}. A working implementation is available at \url{https://github.com/connor-makowski/tokenizers} on the functionalizer branch.
+
+\begin{thebibliography}{10}
+
+\bibitem[Sennrich et al.(2016)]{sennrich2016}
+Sennrich, R., Haddow, B., \& Birch, A. (2016). Neural Machine Translation of Rare Words with Subword Units. \emph{arXiv preprint arXiv:1508.07909}.
+% Link: https://arxiv.org/abs/1508.07909
+
+\bibitem[Kudo(2018)]{kudo2018}
+Kudo, T. (2018). Subword Regularization: Improving Neural Network Translation Models with Multiple Subword Candidates. \emph{arXiv preprint arXiv:1804.10959}.
+% Link: https://arxiv.org/abs/1804.10959
+
+\bibitem[Schuster and Nakajima(2012)]{schuster2012}
+Schuster, M., \& Nakajima, K. (2012). Japanese and Korean voice search. In \emph{2012 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)} (pp. 5149--5152). IEEE.
+% Link: https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/37842.pdf
+
+\bibitem[Radford et al.(2019)]{radford2019}
+Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., \& Sutskever, I. (2019). Language Models are Unsupervised Multitask Learners. \emph{OpenAI Blog}.
+% Link: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+
+\bibitem[Creutz and Lagus(2002)]{creutz2002}
+Creutz, M., \& Lagus, K. (2002). Unsupervised Discovery of Morphemes. In \emph{Proceedings of the ACL-02 Workshop on Morphological and Phonological Learning}.
+% Link: https://aclanthology.org/W02-0603/
+
+\bibitem[Creutz and Lagus(2007)]{creutz2007}
+Creutz, M., \& Lagus, K. (2007). Unsupervised Models for Morpheme Segmentation and Morphology Learning. \emph{ACM Transactions on Speech and Language Processing (TSLP)}, 4(1), 3-es.
+% Link: https://dl.acm.org/doi/10.1145/1187415.1187418
+
+\bibitem[Asgari et al.(2025)]{asgari2025}
+Asgari, E., El Kheir, M., \& Sadraei Javaheri, A. (2025). MorphBPE: A Morpho-Aware Tokenizer Bridging Linguistic Complexity for Efficient LLM Training Across Morphologies. \emph{arXiv preprint arXiv:2502.00894}.
+% Link: https://arxiv.org/abs/2502.00894
+
+\bibitem[Bayram et al.(2025)]{turkish2025}
+Bayram, M. A., Fincan, A. A., G{\"u}m{\"u}{\c{s}}, A. S., Karaka{\c{s}}, S., Diri, B., Y{\i}ld{\i}r{\i}m, S., \& {\c{C}}elik, D. (2025). Tokens with Meaning: A Hybrid Tokenization Approach for Turkish. \emph{arXiv preprint arXiv:2508.14292}.
+% Link: https://arxiv.org/abs/2508.14292
+
+\bibitem[Xue et al.(2022)]{xue2022}
+Xue, L., Barua, A., Constant, N., Al-Rfou, R., Narang, S., Kale, M., Roberts, A., \& Raffel, C. (2022). ByT5: Towards a Token-Free Future with Pre-trained Byte-to-Byte Models. \emph{arXiv preprint arXiv:2105.13626}.
+% Link: https://arxiv.org/abs/2105.13626
+
+\bibitem[Kallini et al.(2024)]{mrt52024}
+Kallini, J., Murty, S., Manning, C. D., Potts, C., \& Csord{\'a}s, R. (2024). MrT5: Dynamic Token Merging for Efficient Byte-level Language Models. \emph{arXiv preprint arXiv:2410.20771}.
+% Link: https://arxiv.org/abs/2410.20771
+
+\bibitem[Yu et al.(2023)]{yu2023}
+Yu, L., Simig, D., Flaherty, C., Aghajanyan, A., Zettlemoyer, L., \& Lewis, M. (2023). MEGABYTE: Predicting Million-byte Sequences with Multiscale Transformers. \emph{arXiv preprint arXiv:2305.07185}.
+% Link: https://arxiv.org/abs/2305.07185
+
+\bibitem[Land and Arnett(2025)]{script2025}
+Land, S., \& Arnett, C. (2025). BPE Stays on SCRIPT: Structured Encoding for Robust Multilingual Pretokenization. \emph{arXiv preprint arXiv:2505.24689}.
+% Link: https://arxiv.org/abs/2505.24689
+
+\bibitem[Gorman and Pinter(2024)]{diacritics2024}
+Gorman, K., \& Pinter, Y. (2024). Don't Touch My Diacritics. \emph{arXiv preprint arXiv:2410.24140}.
+% Link: https://arxiv.org/abs/2410.24140
+
+\end{thebibliography}
+
+\end{document}

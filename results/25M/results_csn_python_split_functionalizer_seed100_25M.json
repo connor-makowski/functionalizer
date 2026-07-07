@@ -1,0 +1,17 @@
+{
+  "dataset": "csn-python",
+  "tokenizer_type": "split_functionalizer",
+  "vocab_size": 16000,
+  "model_parameters": 27238400,
+  "total_train_time_sec": 373.5416305065155,
+  "avg_step_time_ms": 11.056985473632812,
+  "tokens_per_sec": 54612.386770218836,
+  "chars_per_sec": 143091.8153455374,
+  "peak_vram_gb": 3.0317678451538086,
+  "final_val_loss": 3.1753536311439845,
+  "final_ppl_token": 23.935279846191406,
+  "final_ppl_char": 3.359877824783325,
+  "char_to_token_ratio": 2.620134804721003,
+  "train_tokens_count": 19100518,
+  "train_chars_count": 50045932
+}

@@ -1,0 +1,17 @@
+{
+  "dataset": "tinystories",
+  "tokenizer_type": "llama_functionalizer",
+  "vocab_size": 15639,
+  "model_parameters": 27053568,
+  "total_train_time_sec": 339.6565897464752,
+  "avg_step_time_ms": 10.091317224502562,
+  "tokens_per_sec": 60060.663080986786,
+  "chars_per_sec": 224622.38976795922,
+  "peak_vram_gb": 2.8132758140563965,
+  "final_val_loss": 2.9528082800275497,
+  "final_ppl_token": 19.159685134887695,
+  "final_ppl_char": 2.202375888824463,
+  "char_to_token_ratio": 3.739925239670872,
+  "train_tokens_count": 11929589,
+  "train_chars_count": 44615771
+}

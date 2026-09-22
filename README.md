@@ -1,6 +1,8 @@
 # Setup and Execution Guide for Tokenizer Training & Downstream Evaluation
 
-This guide outlines the environment setup process, the correct execution order of the scripts, and key parameters for running experiments.
+This guide outlines the environment setup process, the correct execution order of the scripts, and key parameters for running experiments. 
+
+The modified `tokenizers` library is installed via the steps below, and can be explored here: https://github.com/connor-makowski/tokenizers/tree/functionalizer
 
 ---
 
